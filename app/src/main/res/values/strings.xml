@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">NovaPlayer</string>
+    <string name="permission_audio_title">Allow audio access</string>
+    <string name="permission_audio_message">NovaPlayer needs access to your music files to build your library.</string>
+    <string name="permission_grant">Grant</string>
+    <string name="permission_deny">Not now</string>
+    <string name="now_playing">Now Playing</string>
+    <string name="all_songs">All Songs</string>
+    <string name="no_songs_found">No music found on this device</string>
+    <string name="playback_notification_channel_name">NovaPlayer playback</string>
+    <string name="playback_notification_channel_description">Playback controls and status</string>
+</resources>
+
