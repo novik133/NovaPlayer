@@ -11,7 +11,9 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.MoreExecutors
 import com.novaplayer.app.data.MusicRepository
+import com.novaplayer.app.data.PersistenceHelper
 import com.novaplayer.app.model.Playlist
+import com.novaplayer.app.model.RepeatMode
 import com.novaplayer.app.model.Track
 import com.novaplayer.app.model.UserSettings
 import kotlinx.coroutines.Dispatchers
@@ -25,9 +27,14 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
 
     private val repository = MusicRepository(application)
     private val prefs = application.getSharedPreferences("nova_player_prefs", Context.MODE_PRIVATE)
+    private val persistenceHelper = PersistenceHelper(application)
 
+    private val _allTracks = MutableStateFlow<List<Track>>(emptyList())
     private val _tracks = MutableStateFlow<List<Track>>(emptyList())
     val tracks: StateFlow<List<Track>> = _tracks
+
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery: StateFlow<String> = _searchQuery
 
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading
@@ -44,10 +51,16 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     private val _settings = MutableStateFlow(UserSettings())
     val settings: StateFlow<UserSettings> = _settings
 
+    private val _audioSessionId = MutableStateFlow<Int?>(null)
+    val audioSessionId: StateFlow<Int?> = _audioSessionId
+
     private var controller: MediaController? = null
     private var restoredFromLastState: Boolean = false
+    private var sleepTimerJob: kotlinx.coroutines.Job? = null
 
     init {
+        loadPlaylists()
+        loadSettings()
         connectToService()
         loadTracks()
     }
@@ -66,21 +79,32 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
                     try {
                         val mediaController = controllerFuture.get()
                         controller = mediaController
+                        // Get audio session ID from ExoPlayer if available
+                        if (mediaController.player is androidx.media3.exoplayer.ExoPlayer) {
+                            val exoPlayer = mediaController.player as androidx.media3.exoplayer.ExoPlayer
+                            _audioSessionId.value = exoPlayer.audioSessionId
+                        }
 
                         mediaController.addListener(object : Player.Listener {
                             override fun onIsPlayingChanged(isPlaying: Boolean) {
                                 _isPlaying.value = isPlaying
                             }
 
-                            override fun onMediaItemTransition(
-                                mediaItem: androidx.media3.common.MediaItem?,
-                                reason: Int
-                            ) {
-                                val index = mediaController.currentMediaItemIndex
-                                _tracks.value.getOrNull(index)?.let { track ->
-                                    _currentTrack.value = track
-                                }
+                        override fun onMediaItemTransition(
+                            mediaItem: androidx.media3.common.MediaItem?,
+                            reason: Int
+                        ) {
+                            val index = mediaController.currentMediaItemIndex
+                            _allTracks.value.getOrNull(index)?.let { track ->
+                                _currentTrack.value = track
                             }
+                            // Handle repeat mode end
+                            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO && 
+                                !mediaController.hasNextMediaItem() && 
+                                _settings.value.repeatMode == RepeatMode.OFF) {
+                                mediaController.pause()
+                            }
+                        }
                         })
 
                         maybeRestoreLastPlayback()
@@ -97,11 +121,31 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _isLoading.value = true
             val result = repository.loadAllTracks()
-            _tracks.value = result
+            _allTracks.value = result
+            applySearchFilter()
             _isLoading.value = false
 
             maybeRestoreLastPlayback()
         }
+    }
+
+    fun setSearchQuery(query: String) {
+        _searchQuery.value = query
+        applySearchFilter()
+    }
+
+    private fun applySearchFilter() {
+        val query = _searchQuery.value.lowercase()
+        val filtered = if (query.isBlank()) {
+            _allTracks.value
+        } else {
+            _allTracks.value.filter {
+                it.title.lowercase().contains(query) ||
+                it.artist.lowercase().contains(query) ||
+                it.album.lowercase().contains(query)
+            }
+        }
+        _tracks.value = filtered
     }
 
     fun playTrack(index: Int) {
@@ -109,9 +153,20 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         if (index !in list.indices) return
 
         val controller = controller ?: return
-        controller.setMediaItems(list.map { androidx.media3.common.MediaItem.fromUri(it.uri) })
-        controller.prepare()
-        controller.seekTo(index, 0)
+        val items = list.map { androidx.media3.common.MediaItem.fromUri(it.uri) }
+        
+        if (_settings.value.shuffleMode) {
+            val shuffled = items.shuffled()
+            controller.setMediaItems(shuffled)
+            controller.prepare()
+            controller.seekTo(0, 0)
+        } else {
+            controller.setMediaItems(items)
+            controller.prepare()
+            controller.seekTo(index, 0)
+        }
+        
+        applyRepeatMode()
         controller.play()
         _currentTrack.value = list[index]
     }
@@ -127,14 +182,43 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun skipNext() {
-        controller?.seekToNext()
+        val controller = controller ?: return
+        when (_settings.value.repeatMode) {
+            RepeatMode.ONE -> {
+                controller.seekTo(controller.currentMediaItemIndex, 0)
+            }
+            else -> {
+                if (controller.hasNextMediaItem()) {
+                    controller.seekToNext()
+                } else if (_settings.value.repeatMode == RepeatMode.ALL) {
+                    controller.seekTo(0, 0)
+                }
+            }
+        }
     }
 
     fun skipPrevious() {
-        controller?.seekToPrevious()
+        val controller = controller ?: return
+        if (controller.currentPosition > 3000) {
+            controller.seekTo(controller.currentMediaItemIndex, 0)
+        } else {
+            if (controller.hasPreviousMediaItem()) {
+                controller.seekToPrevious()
+            } else if (_settings.value.repeatMode == RepeatMode.ALL) {
+                controller.seekTo(controller.mediaItemCount - 1, 0)
+            }
+        }
     }
 
-    // region Playlists (in-memory for now)
+    // region Playlists (persistent)
+
+    private fun loadPlaylists() {
+        _playlists.value = persistenceHelper.loadPlaylists()
+    }
+
+    private fun savePlaylists() {
+        persistenceHelper.savePlaylists(_playlists.value)
+    }
 
     fun createPlaylist(name: String) {
         if (name.isBlank()) return
@@ -144,6 +228,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             name = name.trim(),
             trackIds = emptyList()
         )
+        savePlaylists()
     }
 
     fun renamePlaylist(id: Long, newName: String) {
@@ -151,10 +236,12 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         _playlists.value = _playlists.value.map {
             if (it.id == id) it.copy(name = newName.trim()) else it
         }
+        savePlaylists()
     }
 
     fun deletePlaylist(id: Long) {
         _playlists.value = _playlists.value.filterNot { it.id == id }
+        savePlaylists()
     }
 
     fun addTrackToPlaylist(playlistId: Long, trackId: Long) {
@@ -165,6 +252,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
                 playlist
             }
         }
+        savePlaylists()
     }
 
     fun removeTrackFromPlaylist(playlistId: Long, trackId: Long) {
@@ -175,41 +263,110 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
                 playlist
             }
         }
+        savePlaylists()
     }
 
     fun playPlaylist(playlistId: Long, startIndex: Int = 0) {
         val playlist = _playlists.value.firstOrNull { it.id == playlistId } ?: return
         if (playlist.trackIds.isEmpty()) return
 
-        val allTracks = _tracks.value.associateBy { it.id }
+        val allTracks = _allTracks.value.associateBy { it.id }
         val playlistTracks = playlist.trackIds.mapNotNull { allTracks[it] }
         if (playlistTracks.isEmpty() || startIndex !in playlistTracks.indices) return
 
         val controller = controller ?: return
-        controller.setMediaItems(
-            playlistTracks.map { androidx.media3.common.MediaItem.fromUri(it.uri) }
-        )
-        controller.prepare()
-        controller.seekTo(startIndex, 0)
+        val items = playlistTracks.map { androidx.media3.common.MediaItem.fromUri(it.uri) }
+        
+        if (_settings.value.shuffleMode) {
+            val shuffled = items.shuffled()
+            controller.setMediaItems(shuffled)
+            controller.prepare()
+            controller.seekTo(0, 0)
+        } else {
+            controller.setMediaItems(items)
+            controller.prepare()
+            controller.seekTo(startIndex, 0)
+        }
+        
+        applyRepeatMode()
         controller.play()
         _currentTrack.value = playlistTracks[startIndex]
     }
 
     // endregion
 
-    // region Settings (in-memory, not yet persisted)
+    // region Settings (persistent)
+
+    private fun loadSettings() {
+        _settings.value = persistenceHelper.loadSettings()
+    }
+
+    private fun saveSettings() {
+        persistenceHelper.saveSettings(_settings.value)
+    }
 
     fun setDarkTheme(enabled: Boolean) {
         _settings.value = _settings.value.copy(darkTheme = enabled)
+        saveSettings()
     }
 
     fun setGaplessPlayback(enabled: Boolean) {
         _settings.value = _settings.value.copy(gaplessPlayback = enabled)
-        // Hook into player configuration here in a future version
+        saveSettings()
     }
 
     fun setShowWaveform(enabled: Boolean) {
         _settings.value = _settings.value.copy(showWaveform = enabled)
+        saveSettings()
+    }
+
+    fun setShuffleMode(enabled: Boolean) {
+        _settings.value = _settings.value.copy(shuffleMode = enabled)
+        saveSettings()
+        // Re-shuffle current queue if playing
+        val controller = controller ?: return
+        if (controller.mediaItemCount > 0) {
+            val currentIndex = controller.currentMediaItemIndex
+            val items = (0 until controller.mediaItemCount).map { controller.getMediaItemAt(it) }
+            if (enabled) {
+                val shuffled = items.shuffled()
+                controller.setMediaItems(shuffled)
+                controller.seekTo(0, 0)
+            } else {
+                controller.setMediaItems(items)
+                controller.seekTo(currentIndex.coerceIn(0, items.size - 1), 0)
+            }
+        }
+    }
+
+    fun setRepeatMode(mode: RepeatMode) {
+        _settings.value = _settings.value.copy(repeatMode = mode)
+        saveSettings()
+        applyRepeatMode()
+    }
+
+    private fun applyRepeatMode() {
+        val controller = controller ?: return
+        when (_settings.value.repeatMode) {
+            RepeatMode.OFF -> controller.repeatMode = Player.REPEAT_MODE_OFF
+            RepeatMode.ALL -> controller.repeatMode = Player.REPEAT_MODE_ALL
+            RepeatMode.ONE -> controller.repeatMode = Player.REPEAT_MODE_ONE
+        }
+    }
+
+    fun setSleepTimer(minutes: Int) {
+        _settings.value = _settings.value.copy(sleepTimerMinutes = minutes)
+        saveSettings()
+        
+        sleepTimerJob?.cancel()
+        if (minutes > 0) {
+            sleepTimerJob = viewModelScope.launch {
+                kotlinx.coroutines.delay(minutes * 60 * 1000L)
+                controller?.pause()
+                _settings.value = _settings.value.copy(sleepTimerMinutes = 0)
+                saveSettings()
+            }
+        }
     }
 
     // endregion
@@ -229,7 +386,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     private fun maybeRestoreLastPlayback() {
         if (restoredFromLastState) return
         val controller = controller ?: return
-        val list = _tracks.value
+        val list = _allTracks.value
         if (list.isEmpty()) return
 
         val index = prefs.getInt(KEY_LAST_INDEX, -1)
@@ -238,8 +395,10 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
 
         restoredFromLastState = true
 
-        controller.setMediaItems(list.map { androidx.media3.common.MediaItem.fromUri(it.uri) })
+        val items = list.map { androidx.media3.common.MediaItem.fromUri(it.uri) }
+        controller.setMediaItems(items)
         controller.prepare()
+        applyRepeatMode()
         controller.seekTo(index, position)
         controller.play()
         _currentTrack.value = list[index]
@@ -252,6 +411,9 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
 
     override fun onCleared() {
         savePlaybackState()
+        savePlaylists()
+        saveSettings()
+        sleepTimerJob?.cancel()
         controller?.release()
         controller = null
         super.onCleared()

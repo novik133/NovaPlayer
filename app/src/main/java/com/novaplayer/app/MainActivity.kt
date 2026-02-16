@@ -113,11 +113,13 @@ private fun NovaPlayerRoot(viewModel: PlaybackViewModel) {
         val scope = rememberCoroutineScope()
 
         val tracks by viewModel.tracks.collectAsStateWithLifecycle()
+        val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
         val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
         val currentTrack by viewModel.currentTrack.collectAsStateWithLifecycle()
         val isPlaying by viewModel.isPlaying.collectAsStateWithLifecycle()
         val playlists by viewModel.playlists.collectAsStateWithLifecycle()
         val settings by viewModel.settings.collectAsStateWithLifecycle()
+        val audioSessionId by viewModel.audioSessionId.collectAsStateWithLifecycle()
 
         var isNowPlayingExpanded by remember { mutableStateOf(false) }
         var showAbout by remember { mutableStateOf(false) }
@@ -149,15 +151,26 @@ private fun NovaPlayerRoot(viewModel: PlaybackViewModel) {
             bottomBar = {
                 if (!showSplash) {
                     Column {
-                        NowPlayingBar(
-                            track = currentTrack,
-                            isPlaying = isPlaying,
-                            showWaveform = settings.showWaveform,
-                            onTogglePlayPause = { viewModel.togglePlayPause() },
-                            onNext = { viewModel.skipNext() },
-                            onPrevious = { viewModel.skipPrevious() },
-                            onClick = { isNowPlayingExpanded = !isNowPlayingExpanded }
-                        )
+                    NowPlayingBar(
+                        track = currentTrack,
+                        isPlaying = isPlaying,
+                        showWaveform = settings.showWaveform,
+                        shuffleMode = settings.shuffleMode,
+                        repeatMode = settings.repeatMode,
+                        onTogglePlayPause = { viewModel.togglePlayPause() },
+                        onNext = { viewModel.skipNext() },
+                        onPrevious = { viewModel.skipPrevious() },
+                        onShuffleClick = { viewModel.setShuffleMode(!settings.shuffleMode) },
+                        onRepeatClick = {
+                            val nextMode = when (settings.repeatMode) {
+                                com.novaplayer.app.model.RepeatMode.OFF -> com.novaplayer.app.model.RepeatMode.ALL
+                                com.novaplayer.app.model.RepeatMode.ALL -> com.novaplayer.app.model.RepeatMode.ONE
+                                com.novaplayer.app.model.RepeatMode.ONE -> com.novaplayer.app.model.RepeatMode.OFF
+                            }
+                            viewModel.setRepeatMode(nextMode)
+                        },
+                        onClick = { isNowPlayingExpanded = !isNowPlayingExpanded }
+                    )
                         NavigationBar {
                             NavigationBarItem(
                                 selected = currentDestination == Destination.LIBRARY,
@@ -228,6 +241,8 @@ private fun NovaPlayerRoot(viewModel: PlaybackViewModel) {
                             TrackListScreen(
                                 tracks = tracks,
                                 isLoading = isLoading,
+                                searchQuery = searchQuery,
+                                onSearchQueryChange = { viewModel.setSearchQuery(it) },
                                 onTrackClick = { index ->
                                     if (tracks.isNotEmpty()) {
                                         viewModel.playTrack(index)
@@ -256,9 +271,14 @@ private fun NovaPlayerRoot(viewModel: PlaybackViewModel) {
                         Destination.SETTINGS -> {
                             SettingsScreen(
                                 settings = settings,
+                                audioSessionId = audioSessionId,
                                 onDarkThemeChanged = { viewModel.setDarkTheme(it) },
                                 onGaplessChanged = { viewModel.setGaplessPlayback(it) },
-                                onWaveformChanged = { viewModel.setShowWaveform(it) }
+                                onWaveformChanged = { viewModel.setShowWaveform(it) },
+                                onShuffleChanged = { viewModel.setShuffleMode(it) },
+                                onRepeatModeChanged = { viewModel.setRepeatMode(it) },
+                                onSleepTimerChanged = { viewModel.setSleepTimer(it) },
+                                onEqualizerClick = { }
                             )
                         }
                     }
