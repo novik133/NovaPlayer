@@ -91,6 +91,8 @@ lint-results*.xml
 
 # Kotlin
 .kotlin/
+.kiro
+.idea
 
 # Compiled output
 app/release/
